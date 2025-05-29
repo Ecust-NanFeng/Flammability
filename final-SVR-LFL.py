@@ -20,7 +20,7 @@ x_std = scaler_x.fit_transform(x)
 y_log = np.log10(y)
 
 
-regressor = SVR(kernel='rbf', C=6, epsilon=0.0002)
+regressor = SVR(kernel='rbf', C=6, epsilon=0.008)
 model = regressor.fit(x_std, y_log)
 train_pre = model.predict(x_std)
 train_pre = pd.DataFrame(train_pre)
