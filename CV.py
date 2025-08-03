@@ -1,0 +1,287 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, random_split
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.model_selection import  KFold
+from sklearn.preprocessing import StandardScaler
+from dataset import MixtureDataset, collate_fn
+from model import MixtureGNN
+import itertools
+import warnings
+
+warnings.filterwarnings('ignore')
+
+class EarlyStopping:
+    """
+    Early stopping mechanism to prevent overfitting.
+    """
+
+    def __init__(self, patience=10, min_delta=0.0001, mode='min'):
+        """
+        Initialize early stopping.
+
+        Args:
+            patience (int): Number of epochs to wait before stopping
+            min_delta (float): Minimum change to qualify as improvement
+            mode (str): 'min' for minimizing metric, 'max' for maximizing
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+
+    def __call__(self, val_score):
+        """
+        Check if early stopping criteria are met.
+
+        Args:
+            val_score (float): Current validation score
+
+        Returns:
+            bool: True if training should stop, False otherwise
+        """
+        if self.mode == 'min':
+            score = -val_score
+        else:
+            score = val_score
+
+        if self.best_score is None:
+            self.best_score = score
+        elif score < self.best_score + self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.counter = 0
+
+        return self.early_stop
+
+
+def train_epoch(model, train_loader, optimizer, criterion, device, scaler):
+    """
+    Train the model for one epoch.
+
+    Args:
+        model: The model to train
+        train_loader: DataLoader for training data
+        optimizer: Optimizer for model parameters
+        criterion: Loss function
+        device: Device to run the model on
+        scaler: Scaler for inverse transformation
+
+    Returns:
+        tuple: Average loss, RMSE, R2, MAE ,predictions, targets for the epoch
+    """
+    model.train()
+    total_loss = 0
+    predictions = []
+    targets = []
+    predictions_original = []
+    targets_original = []
+
+    for batch in train_loader:
+        if batch['graphs'] is not None:
+            batch['graphs'] = batch['graphs'].to(device)
+        batch['targets'] = batch['targets'].to(device)
+
+        batch['ratios'] = [r.to(device) for r in batch['ratios']]
+
+        optimizer.zero_grad()
+
+        preds = model(batch)
+        loss = criterion(preds, batch['targets'])
+
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item() * len(batch['targets'])
+        predictions.extend(preds.detach().cpu().numpy())
+        targets.extend(batch['targets'].cpu().numpy())
+
+        # Inverse transform predictions and targets for original scale metrics
+        preds_denorm = scaler.inverse_transform(preds.detach().cpu().numpy().reshape(-1, 1)).flatten()
+        targets_denorm = scaler.inverse_transform(batch['targets'].cpu().numpy().reshape(-1, 1)).flatten()
+
+        predictions_original.extend(preds_denorm)
+        targets_original.extend(targets_denorm)
+
+    avg_loss = total_loss / len(train_loader.dataset)
+    rmse = np.sqrt(mean_squared_error(targets_original, predictions_original))
+    r2 = r2_score(targets_original, predictions_original)
+    mae = mean_absolute_error(targets_original, predictions_original)
+
+    return avg_loss, rmse, r2, mae, predictions_original, targets_original
+
+
+def evaluate(model, val_loader, criterion, device, scaler):
+    """
+    Evaluate the model on validation data.
+
+    Args:
+        model: The model to evaluate
+        val_loader: DataLoader for validation data
+        criterion: Loss function
+        device: Device to run the model on
+        scaler: Scaler for inverse transformation
+
+    Returns:
+        tuple: Average loss, RMSE, R2, MAE, predictions, targets
+    """
+    model.eval()
+    total_loss = 0
+    predictions = []
+    targets = []
+    predictions_original = []
+    targets_original = []
+
+    with torch.no_grad():
+        for batch in val_loader:
+            if batch['graphs'] is not None:
+                batch['graphs'] = batch['graphs'].to(device)
+            batch['targets'] = batch['targets'].to(device)
+
+            batch['ratios'] = [r.to(device) for r in batch['ratios']]
+
+            preds = model(batch)
+            loss = criterion(preds, batch['targets'])
+
+            total_loss += loss.item() * len(batch['targets'])
+            predictions.extend(preds.cpu().numpy())
+            targets.extend(batch['targets'].cpu().numpy())
+
+            # Inverse transform predictions and targets for original scale metrics
+            preds_denorm = scaler.inverse_transform(preds.cpu().numpy().reshape(-1, 1)).flatten()
+            targets_denorm = scaler.inverse_transform(batch['targets'].cpu().numpy().reshape(-1, 1)).flatten()
+
+            predictions_original.extend(preds_denorm)
+            targets_original.extend(targets_denorm)
+
+    avg_loss = total_loss / len(val_loader.dataset)
+    rmse = np.sqrt(mean_squared_error(targets_original, predictions_original))
+    r2 = r2_score(targets_original, predictions_original)
+    mae = mean_absolute_error(targets_original, predictions_original)
+
+    return avg_loss, rmse, r2, mae, predictions_original, targets_original
+
+
+def grid_search_cv(df, param_grid, label, k=10, epochs=30, start=1):
+    """
+    Perform grid search with K-fold cross-validation for hyperparameter optimization.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing mixture data
+        param_grid (dict): Dictionary of hyperparameters to search
+        label (str): Target property column name
+        k (int): Number of folds for cross-validation
+        epochs (int): Number of training epochs
+
+    Returns:
+        tuple: Best parameters list, results DataFrame
+    """
+    best_params_list = []
+    results = []
+    """
+    The preset data partitioning scheme from SVR_model was directly adopted, 
+    with the training set and test set loaded accordingly. For specific partitioning logic, 
+    refer to the implementation in the SVR_model.py file.
+    """
+    for fold_outer in range(start, k + 1):
+        # Split data into training and testing sets
+        test_df = df[df['Kold'] == fold_outer]
+        train_df = df[df['Kold'] != fold_outer]
+
+        best_params = None
+        best_score = float('inf')
+
+        # Generate all parameter combinations
+        param_combinations = list(itertools.product(*param_grid.values()))
+        param_names = list(param_grid.keys())
+
+        print(f"Total {len(param_combinations)} parameter combinations to test")
+
+        for i, params in enumerate(param_combinations):
+            param_dict = dict(zip(param_names, params))
+            print(f"\n{fold_outer}, Testing parameter combination {i + 1}/{len(param_combinations)}: {param_dict}")
+
+            # K-fold cross-validation for current parameter combination
+            kf = KFold(n_splits=10, shuffle=True, random_state=0)
+            fold_scores = []
+            for fold_inner, (train_index, val_index) in enumerate(kf.split(train_df)):
+                train_dataset = train_df.iloc[train_index]
+                val_dataset = train_df.iloc[val_index]
+
+                # Standardize labels
+                scaler = StandardScaler()
+                train_dataset[label] = scaler.fit_transform(train_dataset[label].values.reshape(-1, 1)).flatten()
+                val_dataset[label] = scaler.transform(val_dataset[label].values.reshape(-1, 1)).flatten()
+
+                # Create datasets
+                train_dataset = MixtureDataset(train_dataset, label)
+                val_dataset = MixtureDataset(val_dataset, label)
+
+                train_loader = DataLoader(
+                    train_dataset,
+                    batch_size=param_dict['batch_size'],
+                    shuffle=True,
+                    collate_fn=collate_fn,
+                    drop_last=True
+                )
+                val_loader = DataLoader(
+                    val_dataset,
+                    batch_size=param_dict['batch_size'],
+                    shuffle=False,
+                    collate_fn=collate_fn
+                )
+
+                # Initialize model
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                model = MixtureGNN(
+                    num_atom_features=25,
+                    hidden_dim=param_dict['hidden_dim'],
+                    dropout_rate=param_dict['dropout_rate']
+                ).to(device)
+
+                optimizer = torch.optim.Adam(model.parameters(), lr=param_dict['learning_rate'])
+                criterion = nn.MSELoss()
+
+                # Early stopping mechanism
+                early_stopping = EarlyStopping(patience=10, min_delta=0.0001)
+
+                # Training loop
+                for epoch in range(epochs):
+                    train_loss, train_rmse, train_r2, train_mae, _, _ = train_epoch(
+                        model, train_loader, optimizer, criterion, device, scaler
+                    )
+                    val_loss, val_rmse, val_r2, val_mae, _, _ = evaluate(
+                        model, val_loader, criterion, device, scaler
+                    )
+
+                    if early_stopping(val_mae):
+                        break
+
+                fold_scores.append(val_mae)
+
+            # Calculate average performance for current parameter combination
+            avg_score = np.mean(fold_scores)
+            std_score = np.std(fold_scores)
+
+            results.append({'kold': fold_outer,
+                            **param_dict,
+                            'avg_val_mae': avg_score,
+                            'std_val_mae': std_score
+                            })
+
+            print(f"Average validation MAE: {avg_score:.4f} ± {std_score:.4f}")
+
+            # Update best parameters
+            if avg_score < best_score:
+                best_score = avg_score
+                best_params = param_dict
+        best_params_list.append(best_params)
+
+    return best_params_list, pd.DataFrame(results)
