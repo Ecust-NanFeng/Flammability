@@ -12,12 +12,18 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
+"""
+Take the prediction of LFL using the SVR model on the associative dataset as an example. 
+Other statistical machine learning models can be implemented similarly by substituting the model type, 
+adjusting hyperparameters, and/or using a different dataset as needed.
+"""
 
 # ===================== DATA LOADING AND PREPROCESSING =====================
 
 def load_and_prepare_data():
     """
     Load and prepare mixture and pure substance datasets.
+    
 
     Returns:
         pd.DataFrame: Combined dataset with mixture and pure substance data
@@ -47,6 +53,7 @@ def load_and_prepare_data():
 
     # Prepare mixture data
     data_mixture = mixture_data[all_columns].copy()
+    # Load the mixture class to assign labels to mixtures sharing identical components.
     data_mixture['Class'] = mixture_data['Class']
     data_mixture['Type'] = mixture_data['Type']
 
@@ -54,6 +61,7 @@ def load_and_prepare_data():
 
     # Prepare pure substance data
     data_pure = pure_data[all_columns].copy()
+    # Each pure organic substance is assigned to its own distinct class.
     data_pure['Class'] = range(max(data_mixture['Class'])+1, data_pure.shape[0] + max(data_mixture['Class'])+1)  # Assign unique IDs
     data_pure['Type'] = pure_data['Type']
 
@@ -227,11 +235,12 @@ def run_cross_validation(data_mixture, data_pure, feature_columns, param_grid):
     # Set up K-fold cross-validation
     kf_mix = KFold(n_splits=10, shuffle=True, random_state=0)
     kf_pure = KFold(n_splits=10, shuffle=True, random_state=0)
-    split_indices = pd.DataFrame(range(76))  # Assuming 76 mixture samples
+    split_indices = pd.DataFrame(range(max(data_mixture['Class'])))  # Assuming 76 mixture samples
 
     # Perform cross-validation
     fold_iterator = zip(kf_mix.split(split_indices), kf_pure.split(data_pure))
-
+    
+    # Divide the dataset based on class.
     for fold, ((train_mix_idx, test_mix_idx), (train_pure_idx, test_pure_idx)) in enumerate(fold_iterator):
         print(f"Processing fold {fold + 1}/10...")
 
@@ -362,3 +371,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
